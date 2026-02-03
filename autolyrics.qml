@@ -11,6 +11,7 @@ import MuseScore 3.0
 import QtQuick 2.9
 import QtQuick.Controls 2.2
 import QtQuick.Layouts 1.2
+import Qt.labs.platform 1.1
 
 MuseScore {
     id: autoLyrics
@@ -44,6 +45,7 @@ MuseScore {
     property var measureMap: ({})
     property int totalMeasures: 100
     property string logText: ""
+    property string exportPath: ""
     
     // =========================================================================
     // LOGGING
@@ -385,6 +387,168 @@ MuseScore {
         log("=== Step 1 Complete ===");
         log("Next step: MusicXML export");
     }
+
+    // =========================================================================
+    // MUSICXML EXPORT
+    // =========================================================================
+
+    function toLocalFile(url) {
+        if (!url) return "";
+        var path = url.toString();
+        if (path.indexOf("file://") === 0) {
+            return path.replace("file://", "");
+        }
+        return path;
+    }
+
+    function buildNotesForStaffVoice(staffIdx, voiceIdx) {
+        var notesByMeasure = {};
+        if (!curScore) return notesByMeasure;
+
+        var cursor = curScore.newCursor();
+        cursor.staffIdx = staffIdx;
+        cursor.voice = voiceIdx;
+        cursor.rewind(0);
+
+        while (cursor.segment) {
+            var element = cursor.element;
+            if (element && element.type === Element.CHORD) {
+                var tick = cursor.tick;
+                var measureNum = getMeasureNumberAtTick(tick);
+                if (!notesByMeasure[measureNum]) {
+                    notesByMeasure[measureNum] = [];
+                }
+                if (element.notes && element.notes.length > 0) {
+                    var note = element.notes[0];
+                    notesByMeasure[measureNum].push({
+                        pitch: note.pitch
+                    });
+                }
+            }
+            cursor.next();
+        }
+
+        return notesByMeasure;
+    }
+
+    function pitchToStepAlterOctave(pitch) {
+        var steps = ["C", "C", "D", "D", "E", "F", "F", "G", "G", "A", "A", "B"];
+        var alters = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0];
+        var pc = pitch % 12;
+        var step = steps[pc];
+        var alter = alters[pc];
+        var octave = Math.floor(pitch / 12) - 1;
+        return { step: step, alter: alter, octave: octave };
+    }
+
+    function buildMusicXml() {
+        buildMeasureMap();
+
+        var xml = [];
+        xml.push("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+        xml.push("<score-partwise version=\"3.1\">");
+        xml.push("  <part-list>");
+
+        for (var i = 0; i < selectedStaffModel.count; i++) {
+            var item = selectedStaffModel.get(i);
+            var partId = "P" + (i + 1);
+            xml.push("    <score-part id=\"" + partId + "\">");
+            xml.push("      <part-name>" + item.staffName + "</part-name>");
+            xml.push("    </score-part>");
+        }
+
+        xml.push("  </part-list>");
+
+        for (var p = 0; p < selectedStaffModel.count; p++) {
+            var staffItem = selectedStaffModel.get(p);
+            var staffIdx = staffItem.staffIndex;
+            var config = staffConfigs[staffIdx];
+            var partIdValue = "P" + (p + 1);
+            var notesByMeasure = buildNotesForStaffVoice(staffIdx, config.voice);
+
+            xml.push("  <part id=\"" + partIdValue + "\">");
+
+            for (var m = 1; m <= totalMeasures; m++) {
+                xml.push("    <measure number=\"" + m + "\">");
+
+                if (m === 1) {
+                    xml.push("      <attributes>");
+                    xml.push("        <divisions>1</divisions>");
+                    xml.push("        <time>");
+                    xml.push("          <beats>" + getBeatsInMeasure(1) + "</beats>");
+                    xml.push("          <beat-type>4</beat-type>");
+                    xml.push("        </time>");
+                    xml.push("        <clef>");
+                    xml.push("          <sign>G</sign>");
+                    xml.push("          <line>2</line>");
+                    xml.push("        </clef>");
+                    xml.push("      </attributes>");
+                }
+
+                var notesInMeasure = notesByMeasure[m] || [];
+                if (notesInMeasure.length === 0) {
+                    xml.push("      <note>");
+                    xml.push("        <rest/>");
+                    xml.push("        <duration>1</duration>");
+                    xml.push("        <type>quarter</type>");
+                    xml.push("      </note>");
+                } else {
+                    for (var n = 0; n < notesInMeasure.length; n++) {
+                        var noteInfo = notesInMeasure[n];
+                        var pitchInfo = pitchToStepAlterOctave(noteInfo.pitch);
+                        xml.push("      <note>");
+                        xml.push("        <pitch>");
+                        xml.push("          <step>" + pitchInfo.step + "</step>");
+                        if (pitchInfo.alter !== 0) {
+                            xml.push("          <alter>" + pitchInfo.alter + "</alter>");
+                        }
+                        xml.push("          <octave>" + pitchInfo.octave + "</octave>");
+                        xml.push("        </pitch>");
+                        xml.push("        <duration>1</duration>");
+                        xml.push("        <type>quarter</type>");
+                        xml.push("      </note>");
+                    }
+                }
+
+                xml.push("    </measure>");
+            }
+
+            xml.push("  </part>");
+        }
+
+        xml.push("</score-partwise>");
+        return xml.join("\n");
+    }
+
+    function exportMusicXml(filePath) {
+        if (!curScore) {
+            log("ERROR: No score open!");
+            return;
+        }
+        if (selectedStaffModel.count === 0) {
+            log("ERROR: No staves selected");
+            return;
+        }
+
+        var finalPath = filePath || exportPath;
+        if (!finalPath || finalPath === "") {
+            log("ERROR: No export path selected");
+            return;
+        }
+
+        var xmlContent = buildMusicXml();
+        var file = new QFile(finalPath);
+        if (!file.open(QIODevice.WriteOnly | QIODevice.Truncate)) {
+            log("ERROR: Cannot open file: " + finalPath);
+            return;
+        }
+
+        var out = new QTextStream(file);
+        out.writeString(xmlContent);
+        file.close();
+
+        log("MusicXML exported to: " + finalPath);
+    }
     
     // =========================================================================
     // USER INTERFACE
@@ -684,6 +848,22 @@ MuseScore {
                         highlighted: true
                         onClicked: processLyrics()
                     }
+
+                    Button {
+                        text: "Export MusicXML"
+                        Layout.alignment: Qt.AlignRight
+                        onClicked: {
+                            if (!curScore) {
+                                log("ERROR: No score open!");
+                                return;
+                            }
+                            if (selectedStaffModel.count === 0) {
+                                log("ERROR: No staves selected");
+                                return;
+                            }
+                            exportDialog.open();
+                        }
+                    }
                 }
                 
                 // Right column - Log
@@ -746,6 +926,17 @@ MuseScore {
                     }
                 }
             }
+        }
+    }
+
+    FileDialog {
+        id: exportDialog
+        title: "Export MusicXML"
+        nameFilters: ["MusicXML (*.musicxml)", "MusicXML (*.xml)"]
+        fileMode: FileDialog.SaveFile
+        onAccepted: {
+            exportPath = toLocalFile(exportDialog.file);
+            exportMusicXml(exportPath);
         }
     }
 }
